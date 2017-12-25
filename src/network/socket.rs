@@ -111,7 +111,7 @@ impl Socket {
     }
 
     /// Peer address
-    pub fn receiver_address(&mut self) -> Result<Address, util::Error> {
+    pub fn receiver_address(&self) -> Result<Address, util::Error> {
         with_socket!(self, sock, {
             match sock.peer_addr() {
                 Ok(addr) => {
@@ -127,7 +127,7 @@ impl Socket {
     }
 
     /// Our own address
-    pub fn sender_address(&mut self) -> Result<Address, util::Error> {
+    pub fn sender_address(&self) -> Result<Address, util::Error> {
         with_socket!(self, sock, {
             match sock.local_addr() {
                 Ok(addr) => {
@@ -143,7 +143,7 @@ impl Socket {
     }
 
     /// Produce a version message appropriate for this socket
-    pub fn version_message(&mut self, start_height: i32) -> Result<NetworkMessage, util::Error> {
+    pub fn version_message(&self, start_height: i32) -> Result<NetworkMessage, util::Error> {
         let recv_addr = try!(self.receiver_address());
         let send_addr = try!(self.sender_address());
         let timestamp = match SystemTime::now().duration_since(UNIX_EPOCH) {
