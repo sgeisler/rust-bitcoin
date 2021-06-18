@@ -21,6 +21,280 @@ use std::ops;
 use std::str::FromStr;
 use std::cmp::Ordering;
 
+/// Unified interface for both [`Amount`] and [`SignedAmount`]
+pub trait AmountTrait: Copy + Default {
+    /// Inner representation of the amount (`u64` or `i64`)
+    type Inner: Num;
+
+    /// The zero amount.
+    const ZERO: Self;
+    /// Exactly one satoshi.
+    const ONE_SAT: Self;
+    /// Exactly one bitcoin.
+    const ONE_BTC: Self;
+
+    /// Create an [Amount] with satoshi precision and the given number of satoshis.
+    fn from_sat(satoshi: Self::Inner) -> Self;
+
+    /// Get the number of satoshis in this [Amount].
+    fn as_sat(self) -> Self::Inner;
+
+    /// The maximum value of the amount type.
+    fn max_value() -> Self {
+        Self::from_sat(Self::Inner::max_value())
+    }
+
+    /// The minimum value of the amount type.
+    fn min_value() -> Self {
+        Self::from_sat(Self::Inner::min_value())
+    }
+
+    /// Convert from a value expressing bitcoins to an [Amount].
+    fn from_btc(btc: f64) -> Result<Self, ParseAmountError> {
+        Self::from_float_in(btc, Denomination::Bitcoin)
+    }
+
+    /// Parse a decimal string as a value in the given denomination.
+    ///
+    /// Note: This only parses the value string.  If you want to parse a value
+    /// with denomination, use [FromStr].
+    fn from_str_in(s: &str, denom: Denomination) -> Result<Self, ParseAmountError> {
+        let (negative, satoshi) = parse_signed_to_satoshi(s, denom)?;
+        Ok(Self::from_sat(Self::Inner::try_from_u64_with_sign(negative, satoshi)?))
+    }
+
+    /// Parses amounts with denomination suffix like they are produced with
+    /// [Self::to_string_with_denomination] or with [fmt::Display].
+    /// If you want to parse only the amount without the denomination,
+    /// use [Self::from_str_in].
+    fn from_str_with_denomination(s: &str) -> Result<Self, ParseAmountError> {
+        let mut split = s.splitn(3, ' ');
+        let amt_str = split.next().unwrap();
+        let denom_str = split.next().ok_or(ParseAmountError::InvalidFormat)?;
+        if split.next().is_some() {
+            return Err(ParseAmountError::InvalidFormat);
+        }
+
+        Ok(Self::from_str_in(amt_str, denom_str.parse()?)?)
+    }
+
+    /// Express this [Amount] as a floating-point value in the given denomination.
+    ///
+    /// Please be aware of the risk of using floating-point numbers.
+    fn to_float_in(self, denom: Denomination) -> f64 {
+        f64::from_str(&self.to_string_in(denom)).unwrap()
+    }
+
+    /// Express this [Amount] as a floating-point value in Bitcoin.
+    ///
+    /// Equivalent to `to_float_in(Denomination::Bitcoin)`.
+    ///
+    /// Please be aware of the risk of using floating-point numbers.
+    fn as_btc(self) -> f64 {
+        self.to_float_in(Denomination::Bitcoin)
+    }
+
+    /// Convert this [Amount] in floating-point notation with a given
+    /// denomination.
+    /// Can return error if the amount is too big, too precise or negative.
+    ///
+    /// Please be aware of the risk of using floating-point numbers.
+    fn from_float_in(value: f64, denom: Denomination) -> Result<Self, ParseAmountError> {
+        // This is inefficient, but the safest way to deal with this. The parsing logic is safe.
+        // Any performance-critical application should not be dealing with floats.
+        Self::from_str_in(&value.to_string(), denom)
+    }
+
+    /// Format the value of this [Amount] in the given denomination.
+    ///
+    /// Does not include the denomination.
+    fn fmt_value_in(self, f: &mut dyn fmt::Write, denom: Denomination) -> fmt::Result {
+        fmt_satoshi_in(self.as_sat(), f, denom)
+    }
+
+    /// Get a string number of this [Amount] in the given denomination.
+    ///
+    /// Does not include the denomination.
+    fn to_string_in(self, denom: Denomination) -> String {
+        let mut buf = String::new();
+        self.fmt_value_in(&mut buf, denom).unwrap();
+        buf
+    }
+
+    /// Get a formatted string of this [Amount] in the given denomination,
+    /// suffixed with the abbreviation for the denomination.
+    fn to_string_with_denomination(self, denom: Denomination) -> String {
+        let mut buf = String::new();
+        self.fmt_value_in(&mut buf, denom).unwrap();
+        write!(buf, " {}", denom).unwrap();
+        buf
+    }
+
+    // Some arithmetic that doesn't fit in `std::ops` traits.
+
+    /// Checked addition.
+    /// Returns [None] if overflow occurred.
+    fn checked_add(self, rhs: Self) -> Option<Self> {
+        self.as_sat().checked_add(rhs.as_sat()).map(Self::from_sat)
+    }
+
+    /// Checked subtraction.
+    /// Returns [None] if overflow occurred.
+    fn checked_sub(self, rhs: Self) -> Option<Self> {
+        self.as_sat().checked_sub(rhs.as_sat()).map(Self::from_sat)
+    }
+
+    /// Checked multiplication.
+    /// Returns [None] if overflow occurred.
+    fn checked_mul(self, rhs: Self::Inner) -> Option<Self> {
+        self.as_sat().checked_mul(rhs).map(Self::from_sat)
+    }
+
+    /// Checked integer division.
+    /// Be aware that integer division loses the remainder if no exact division
+    /// can be made.
+    /// Returns [None] if overflow occurred.
+    fn checked_div(self, rhs: Self::Inner) -> Option<Self> {
+        self.as_sat().checked_div(rhs).map(Self::from_sat)
+    }
+
+    /// Checked remainder.
+    /// Returns [None] if overflow occurred.
+    fn checked_rem(self, rhs: Self::Inner) -> Option<Self> {
+        self.as_sat().checked_rem(rhs).map(Self::from_sat)
+    }
+}
+
+/// Various functionality that exists for all integer types
+pub trait Num: Sized {
+    /// Construct the number from an absolute value and a sign (`false` = positive, `true`=negative)
+    fn try_from_u64_with_sign(sign: bool, num: u64) -> Result<Self, ParseAmountError>;
+
+    // TODO: sign enum
+    /// Split the number into its sign (`false` = positive, `true`=negative) and the absolute value
+    fn to_u64_with_sign(self) -> (bool, u64);
+
+    /// Minimum value representable by the type
+    fn min_value() -> Self;
+
+    /// Maximum value representable by the type
+    fn max_value() -> Self;
+
+    /// Checked addition.
+    /// Returns [None] if overflow occurred.
+    fn checked_add(self, rhs: Self) -> Option<Self>;
+
+    /// Checked subtraction.
+    /// Returns [None] if overflow occurred.
+    fn checked_sub(self, rhs: Self) -> Option<Self>;
+
+    /// Checked multiplication.
+    /// Returns [None] if overflow occurred.
+    fn checked_mul(self, rhs: Self) -> Option<Self>;
+
+    /// Checked integer division.
+    /// Be aware that integer division loses the remainder if no exact division
+    /// can be made.
+    /// Returns [None] if overflow occurred.
+    fn checked_div(self, rhs: Self) -> Option<Self>;
+
+    /// Checked remainder.
+    /// Returns [None] if overflow occurred.
+    fn checked_rem(self, rhs: Self) -> Option<Self>;
+}
+
+impl Num for u64 {
+    fn try_from_u64_with_sign(sign: bool, num: u64) -> Result<Self, ParseAmountError> {
+        if sign {
+            return Err(ParseAmountError::Negative);
+        }
+
+        Ok(num)
+    }
+
+    fn to_u64_with_sign(self) -> (bool, u64) {
+        (false, self)
+    }
+
+    fn min_value() -> Self {
+        u64::min_value()
+    }
+
+    fn max_value() -> Self {
+        u64::max_value()
+    }
+
+    fn checked_add(self, rhs: Self) -> Option<Self> {
+        self.checked_add(rhs)
+    }
+
+    fn checked_sub(self, rhs: Self) -> Option<Self> {
+        self.checked_sub(rhs)
+    }
+
+    fn checked_mul(self, rhs: u64) -> Option<Self> {
+        self.checked_mul(rhs)
+    }
+
+    fn checked_div(self, rhs: u64) -> Option<Self> {
+        self.checked_div(rhs)
+    }
+
+    fn checked_rem(self, rhs: u64) -> Option<Self> {
+        self.checked_rem(rhs)
+    }
+}
+
+impl Num for i64 {
+    fn try_from_u64_with_sign(sign: bool, num: u64) -> Result<Self, ParseAmountError> {
+        if !sign && num > (<Self as Num>::max_value() as u64) {
+            return Err(ParseAmountError::InputOutOfRange);
+        }
+
+        if sign && num > (<Self as Num>::min_value().abs() as u64) {
+            return Err(ParseAmountError::InputOutOfRange);
+        }
+
+        Ok(if sign {
+            -1 * (num as i64)
+        } else {
+            num as i64
+        })
+    }
+
+    fn to_u64_with_sign(self) -> (bool, u64) {
+        (self.is_negative(), self.abs() as u64)
+    }
+
+    fn min_value() -> Self {
+        i64::min_value()
+    }
+
+    fn max_value() -> Self {
+        i64::max_value()
+    }
+
+    fn checked_add(self, rhs: Self) -> Option<Self> {
+        self.checked_add(rhs)
+    }
+
+    fn checked_sub(self, rhs: Self) -> Option<Self> {
+        self.checked_sub(rhs)
+    }
+
+    fn checked_mul(self, rhs: Self) -> Option<Self> {
+        self.checked_mul(rhs)
+    }
+
+    fn checked_div(self, rhs: Self) -> Option<Self> {
+        self.checked_div(rhs)
+    }
+
+    fn checked_rem(self, rhs: Self) -> Option<Self> {
+        self.checked_rem(rhs)
+    }
+}
+
 /// A set of denominations in which amounts can be expressed.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub enum Denomination {
@@ -94,7 +368,7 @@ pub enum ParseAmountError {
     /// Invalid number format.
     InvalidFormat,
     /// Input string was too large.
-    InputTooLarge,
+    InputOutOfRange,
     /// Invalid character in input.
     InvalidCharacter(char),
     /// The denomination was unknown.
@@ -108,7 +382,7 @@ impl fmt::Display for ParseAmountError {
             ParseAmountError::TooBig => f.write_str("amount is too big"),
             ParseAmountError::TooPrecise => f.write_str("amount has a too high precision"),
             ParseAmountError::InvalidFormat => f.write_str("invalid number format"),
-            ParseAmountError::InputTooLarge => f.write_str("input string was too large"),
+            ParseAmountError::InputOutOfRange => f.write_str("input string was too large"),
             ParseAmountError::InvalidCharacter(c) => write!(f, "invalid character in input: {}", c),
             ParseAmountError::UnknownDenomination(ref d) => write!(f, "unknown denomination: {}",d),
         }
@@ -131,7 +405,7 @@ fn parse_signed_to_satoshi(
         return Err(ParseAmountError::InvalidFormat);
     }
     if s.len() > 50 {
-        return Err(ParseAmountError::InputTooLarge);
+        return Err(ParseAmountError::InputOutOfRange);
     }
 
     let is_negative = s.starts_with('-');
@@ -206,12 +480,13 @@ fn parse_signed_to_satoshi(
 /// Format the given satoshi amount in the given denomination.
 ///
 /// Does not include the denomination.
-fn fmt_satoshi_in(
-    satoshi: u64,
-    negative: bool,
+fn fmt_satoshi_in<T: Num>(
+    value: T,
     f: &mut dyn fmt::Write,
     denom: Denomination,
 ) -> fmt::Result {
+    let (negative, satoshi) = value.to_u64_with_sign();
+
     if negative {
         f.write_str("-")?;
     }
@@ -263,158 +538,28 @@ fn fmt_satoshi_in(
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Amount(u64);
 
-impl Amount {
+impl AmountTrait for Amount {
+    type Inner = u64;
+
     /// The zero amount.
-    pub const ZERO: Amount = Amount(0);
+    const ZERO: Amount = Amount(0);
     /// Exactly one satoshi.
-    pub const ONE_SAT: Amount = Amount(1);
+    const ONE_SAT: Amount = Amount(1);
     /// Exactly one bitcoin.
-    pub const ONE_BTC: Amount = Amount(100_000_000);
+    const ONE_BTC: Amount = Amount(100_000_000);
 
     /// Create an [Amount] with satoshi precision and the given number of satoshis.
-    pub fn from_sat(satoshi: u64) -> Amount {
+    fn from_sat(satoshi: u64) -> Amount {
         Amount(satoshi)
     }
 
     /// Get the number of satoshis in this [Amount].
-    pub fn as_sat(self) -> u64 {
+    fn as_sat(self) -> u64 {
         self.0
     }
+}
 
-    /// The maximum value of an [Amount].
-    pub fn max_value() -> Amount {
-        Amount(u64::max_value())
-    }
-
-    /// The minimum value of an [Amount].
-    pub fn min_value() -> Amount {
-        Amount(u64::min_value())
-    }
-
-    /// Convert from a value expressing bitcoins to an [Amount].
-    pub fn from_btc(btc: f64) -> Result<Amount, ParseAmountError> {
-        Amount::from_float_in(btc, Denomination::Bitcoin)
-    }
-
-    /// Parse a decimal string as a value in the given denomination.
-    ///
-    /// Note: This only parses the value string.  If you want to parse a value
-    /// with denomination, use [FromStr].
-    pub fn from_str_in(s: &str, denom: Denomination) -> Result<Amount, ParseAmountError> {
-        let (negative, satoshi) = parse_signed_to_satoshi(s, denom)?;
-        if negative {
-            return Err(ParseAmountError::Negative);
-        }
-        if satoshi > i64::max_value() as u64 {
-            return Err(ParseAmountError::TooBig);
-        }
-        Ok(Amount::from_sat(satoshi))
-    }
-
-    /// Parses amounts with denomination suffix like they are produced with
-    /// [Self::to_string_with_denomination] or with [fmt::Display].
-    /// If you want to parse only the amount without the denomination,
-    /// use [Self::from_str_in].
-    pub fn from_str_with_denomination(s: &str) -> Result<Amount, ParseAmountError> {
-        let mut split = s.splitn(3, ' ');
-        let amt_str = split.next().unwrap();
-        let denom_str = split.next().ok_or(ParseAmountError::InvalidFormat)?;
-        if split.next().is_some() {
-            return Err(ParseAmountError::InvalidFormat);
-        }
-
-        Ok(Amount::from_str_in(amt_str, denom_str.parse()?)?)
-    }
-
-    /// Express this [Amount] as a floating-point value in the given denomination.
-    ///
-    /// Please be aware of the risk of using floating-point numbers.
-    pub fn to_float_in(self, denom: Denomination) -> f64 {
-        f64::from_str(&self.to_string_in(denom)).unwrap()
-    }
-
-    /// Express this [Amount] as a floating-point value in Bitcoin.
-    ///
-    /// Equivalent to `to_float_in(Denomination::Bitcoin)`.
-    ///
-    /// Please be aware of the risk of using floating-point numbers.
-    pub fn as_btc(self) -> f64 {
-        self.to_float_in(Denomination::Bitcoin)
-    }
-
-    /// Convert this [Amount] in floating-point notation with a given
-    /// denomination.
-    /// Can return error if the amount is too big, too precise or negative.
-    ///
-    /// Please be aware of the risk of using floating-point numbers.
-    pub fn from_float_in(value: f64, denom: Denomination) -> Result<Amount, ParseAmountError> {
-        if value < 0.0 {
-            return Err(ParseAmountError::Negative);
-        }
-        // This is inefficient, but the safest way to deal with this. The parsing logic is safe.
-        // Any performance-critical application should not be dealing with floats.
-        Amount::from_str_in(&value.to_string(), denom)
-    }
-
-    /// Format the value of this [Amount] in the given denomination.
-    ///
-    /// Does not include the denomination.
-    pub fn fmt_value_in(self, f: &mut dyn fmt::Write, denom: Denomination) -> fmt::Result {
-        fmt_satoshi_in(self.as_sat(), false, f, denom)
-    }
-
-    /// Get a string number of this [Amount] in the given denomination.
-    ///
-    /// Does not include the denomination.
-    pub fn to_string_in(self, denom: Denomination) -> String {
-        let mut buf = String::new();
-        self.fmt_value_in(&mut buf, denom).unwrap();
-        buf
-    }
-
-    /// Get a formatted string of this [Amount] in the given denomination,
-    /// suffixed with the abbreviation for the denomination.
-    pub fn to_string_with_denomination(self, denom: Denomination) -> String {
-        let mut buf = String::new();
-        self.fmt_value_in(&mut buf, denom).unwrap();
-        write!(buf, " {}", denom).unwrap();
-        buf
-    }
-
-    // Some arithmetic that doesn't fit in `std::ops` traits.
-
-    /// Checked addition.
-    /// Returns [None] if overflow occurred.
-    pub fn checked_add(self, rhs: Amount) -> Option<Amount> {
-        self.0.checked_add(rhs.0).map(Amount)
-    }
-
-    /// Checked subtraction.
-    /// Returns [None] if overflow occurred.
-    pub fn checked_sub(self, rhs: Amount) -> Option<Amount> {
-        self.0.checked_sub(rhs.0).map(Amount)
-    }
-
-    /// Checked multiplication.
-    /// Returns [None] if overflow occurred.
-    pub fn checked_mul(self, rhs: u64) -> Option<Amount> {
-        self.0.checked_mul(rhs).map(Amount)
-    }
-
-    /// Checked integer division.
-    /// Be aware that integer division loses the remainder if no exact division
-    /// can be made.
-    /// Returns [None] if overflow occurred.
-    pub fn checked_div(self, rhs: u64) -> Option<Amount> {
-        self.0.checked_div(rhs).map(Amount)
-    }
-
-    /// Checked remainder.
-    /// Returns [None] if overflow occurred.
-    pub fn checked_rem(self, rhs: u64) -> Option<Amount> {
-        self.0.checked_rem(rhs).map(Amount)
-    }
-
+impl Amount {
     /// Convert to a signed amount.
     pub fn to_signed(self) -> Result<SignedAmount, ParseAmountError> {
         if self.as_sat() > SignedAmount::max_value().as_sat() as u64 {
@@ -548,128 +693,28 @@ impl ::std::iter::Sum for Amount {
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SignedAmount(i64);
 
-impl SignedAmount {
+impl AmountTrait for SignedAmount {
+    type Inner = i64;
+
     /// The zero amount.
-    pub const ZERO: SignedAmount = SignedAmount(0);
+    const ZERO: SignedAmount = SignedAmount(0);
     /// Exactly one satoshi.
-    pub const ONE_SAT: SignedAmount = SignedAmount(1);
+    const ONE_SAT: SignedAmount = SignedAmount(1);
     /// Exactly one bitcoin.
-    pub const ONE_BTC: SignedAmount = SignedAmount(100_000_000);
+    const ONE_BTC: SignedAmount = SignedAmount(100_000_000);
 
     /// Create an [SignedAmount] with satoshi precision and the given number of satoshis.
-    pub fn from_sat(satoshi: i64) -> SignedAmount {
+    fn from_sat(satoshi: i64) -> SignedAmount {
         SignedAmount(satoshi)
     }
 
     /// Get the number of satoshis in this [SignedAmount].
-    pub fn as_sat(self) -> i64 {
+    fn as_sat(self) -> i64 {
         self.0
     }
+}
 
-    /// The maximum value of an [SignedAmount].
-    pub fn max_value() -> SignedAmount {
-        SignedAmount(i64::max_value())
-    }
-
-    /// The minimum value of an [SignedAmount].
-    pub fn min_value() -> SignedAmount {
-        SignedAmount(i64::min_value())
-    }
-
-    /// Convert from a value expressing bitcoins to an [SignedAmount].
-    pub fn from_btc(btc: f64) -> Result<SignedAmount, ParseAmountError> {
-        SignedAmount::from_float_in(btc, Denomination::Bitcoin)
-    }
-
-    /// Parse a decimal string as a value in the given denomination.
-    ///
-    /// Note: This only parses the value string.  If you want to parse a value
-    /// with denomination, use [FromStr].
-    pub fn from_str_in(s: &str, denom: Denomination) -> Result<SignedAmount, ParseAmountError> {
-        let (negative, satoshi) = parse_signed_to_satoshi(s, denom)?;
-        if satoshi > i64::max_value() as u64 {
-            return Err(ParseAmountError::TooBig);
-        }
-        Ok(match negative {
-            true => SignedAmount(-(satoshi as i64)),
-            false => SignedAmount(satoshi as i64),
-        })
-    }
-
-    /// Parses amounts with denomination suffix like they are produced with
-    /// [Self::to_string_with_denomination] or with [fmt::Display].
-    /// If you want to parse only the amount without the denomination,
-    /// use [Self::from_str_in].
-    pub fn from_str_with_denomination(s: &str) -> Result<SignedAmount, ParseAmountError> {
-        let mut split = s.splitn(3, ' ');
-        let amt_str = split.next().unwrap();
-        let denom_str = split.next().ok_or(ParseAmountError::InvalidFormat)?;
-        if split.next().is_some() {
-            return Err(ParseAmountError::InvalidFormat);
-        }
-
-        Ok(SignedAmount::from_str_in(amt_str, denom_str.parse()?)?)
-    }
-
-    /// Express this [SignedAmount] as a floating-point value in the given denomination.
-    ///
-    /// Please be aware of the risk of using floating-point numbers.
-    pub fn to_float_in(self, denom: Denomination) -> f64 {
-        f64::from_str(&self.to_string_in(denom)).unwrap()
-    }
-
-    /// Express this [SignedAmount] as a floating-point value in Bitcoin.
-    ///
-    /// Equivalent to `to_float_in(Denomination::Bitcoin)`.
-    ///
-    /// Please be aware of the risk of using floating-point numbers.
-    pub fn as_btc(self) -> f64 {
-        self.to_float_in(Denomination::Bitcoin)
-    }
-
-    /// Convert this [SignedAmount] in floating-point notation with a given
-    /// denomination.
-    /// Can return error if the amount is too big, too precise or negative.
-    ///
-    /// Please be aware of the risk of using floating-point numbers.
-    pub fn from_float_in(
-        value: f64,
-        denom: Denomination,
-    ) -> Result<SignedAmount, ParseAmountError> {
-        // This is inefficient, but the safest way to deal with this. The parsing logic is safe.
-        // Any performance-critical application should not be dealing with floats.
-        SignedAmount::from_str_in(&value.to_string(), denom)
-    }
-
-    /// Format the value of this [SignedAmount] in the given denomination.
-    ///
-    /// Does not include the denomination.
-    pub fn fmt_value_in(self, f: &mut dyn fmt::Write, denom: Denomination) -> fmt::Result {
-        let sats = self.as_sat().checked_abs().map(|a: i64| a as u64).unwrap_or_else(|| {
-            // We could also hard code this into `9223372036854775808`
-            u64::max_value() - self.as_sat() as u64 +1
-        });
-        fmt_satoshi_in(sats, self.is_negative(), f, denom)
-    }
-
-    /// Get a string number of this [SignedAmount] in the given denomination.
-    ///
-    /// Does not include the denomination.
-    pub fn to_string_in(self, denom: Denomination) -> String {
-        let mut buf = String::new();
-        self.fmt_value_in(&mut buf, denom).unwrap();
-        buf
-    }
-
-    /// Get a formatted string of this [SignedAmount] in the given denomination,
-    /// suffixed with the abbreviation for the denomination.
-    pub fn to_string_with_denomination(self, denom: Denomination) -> String {
-        let mut buf = String::new();
-        self.fmt_value_in(&mut buf, denom).unwrap();
-        write!(buf, " {}", denom).unwrap();
-        buf
-    }
-
+impl SignedAmount {
     // Some arithmetic that doesn't fit in `std::ops` traits.
 
     /// Get the absolute value of this [SignedAmount].
@@ -698,43 +743,10 @@ impl SignedAmount {
         self.0.is_negative()
     }
 
-
     /// Get the absolute value of this [SignedAmount].
     /// Returns [None] if overflow occurred. (`self == min_value()`)
     pub fn checked_abs(self) -> Option<SignedAmount> {
         self.0.checked_abs().map(SignedAmount)
-    }
-
-    /// Checked addition.
-    /// Returns [None] if overflow occurred.
-    pub fn checked_add(self, rhs: SignedAmount) -> Option<SignedAmount> {
-        self.0.checked_add(rhs.0).map(SignedAmount)
-    }
-
-    /// Checked subtraction.
-    /// Returns [None] if overflow occurred.
-    pub fn checked_sub(self, rhs: SignedAmount) -> Option<SignedAmount> {
-        self.0.checked_sub(rhs.0).map(SignedAmount)
-    }
-
-    /// Checked multiplication.
-    /// Returns [None] if overflow occurred.
-    pub fn checked_mul(self, rhs: i64) -> Option<SignedAmount> {
-        self.0.checked_mul(rhs).map(SignedAmount)
-    }
-
-    /// Checked integer division.
-    /// Be aware that integer division loses the remainder if no exact division
-    /// can be made.
-    /// Returns [None] if overflow occurred.
-    pub fn checked_div(self, rhs: i64) -> Option<SignedAmount> {
-        self.0.checked_div(rhs).map(SignedAmount)
-    }
-
-    /// Checked remainder.
-    /// Returns [None] if overflow occurred.
-    pub fn checked_rem(self, rhs: i64) -> Option<SignedAmount> {
-        self.0.checked_rem(rhs).map(SignedAmount)
     }
 
     /// Subtraction that doesn't allow negative [SignedAmount]s.
@@ -870,19 +882,8 @@ pub trait CheckedSum<R> {
     fn checked_sum(self) -> Option<R>;
 }
 
-impl<T> CheckedSum<Amount> for T where T: Iterator<Item = Amount> {
-    fn checked_sum(mut self) -> Option<Amount> {
-        let first = Some(self.next().unwrap_or_default());
-
-        self.fold(
-            first,
-            |acc, item| acc.and_then(|acc| acc.checked_add(item))
-        )
-    }
-}
-
-impl<T> CheckedSum<SignedAmount> for T where T: Iterator<Item = SignedAmount> {
-    fn checked_sum(mut self) -> Option<SignedAmount> {
+impl<T, A> CheckedSum<A> for T where T: Iterator<Item = A>, A: AmountTrait {
+    fn checked_sum(mut self) -> Option<A> {
         let first = Some(self.next().unwrap_or_default());
 
         self.fold(
@@ -1275,7 +1276,7 @@ mod tests {
         // exactly 50 chars.
         assert_eq!(p("100000000000000.0000000000000000000000000000000000", Denomination::Bitcoin), Err(E::TooBig));
         // more than 50 chars.
-        assert_eq!(p("100000000000000.00000000000000000000000000000000000", Denomination::Bitcoin), Err(E::InputTooLarge));
+        assert_eq!(p("100000000000000.00000000000000000000000000000000000", Denomination::Bitcoin), Err(E::InputOutOfRange));
     }
 
     #[test]
